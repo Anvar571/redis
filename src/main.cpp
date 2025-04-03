@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <poll.h>
+#include <mutex>
 
 #include <vector>
 
@@ -39,6 +40,51 @@ struct Connection {
     std::vector<uint8_t> outgoing;
 };
 
+class ConnectionPool {
+private:
+    std::vector<Connection *> pool;
+    std::mutex _mutex;
+    int max_pool_size = 100;
+public:
+
+    ConnectionPool(int size): max_pool_size(size) {
+        for (int i = 0; i < size; ++i) {
+            pool.push_back(new Connection());
+        }
+    }
+
+    ~ConnectionPool() {
+        for (auto* conn : pool) {
+            delete conn;
+        }
+    }
+
+    Connection* acquire() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!pool.empty()) {
+            Connection* conn = pool.back();
+            pool.pop_back();
+            return conn;
+        }
+        return new Connection();
+    }
+
+    void release(Connection* conn) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (pool.size() < max_pool_size) {
+            conn->fd = -1;
+            conn->incoming.clear();
+            conn->outgoing.clear();
+            conn->want_read = false;
+            conn->want_write = false;
+            conn->want_close = false;
+            pool.push_back(conn);
+        } else {
+            delete conn;
+        }
+    }
+};
+
 static void fd_set_nb(int fd) {
     errno = 0;
     int flags = fcntl(fd, F_GETFL, 0);
@@ -54,7 +100,7 @@ static void fd_set_nb(int fd) {
     }
 }
 
-static Connection *handle_accept(int fd) {
+static Connection *handle_accept(int fd, ConnectionPool& pool) {
 
     struct sockaddr_in client_addr = {};
     socklen_t addrlen = sizeof(client_addr);
@@ -65,7 +111,7 @@ static Connection *handle_accept(int fd) {
 
     fd_set_nb(fd);
 
-    Connection *conn = new Connection();
+    Connection *conn = pool.acquire();
     conn->want_read = true;
     conn->fd = fd;
     return conn;
@@ -188,6 +234,8 @@ int main () {
     printf("Listening on port 1234...\n");
     fflush(stdout);
 
+    ConnectionPool conn_pool(100);
+
     std::vector<Connection *> fd2conn;
     std::vector<struct pollfd> poll_args;
     while (true) {
@@ -217,12 +265,18 @@ int main () {
         }
 
         if (poll_args[0].revents) {
-            if (Connection *conn = handle_accept(fd)) {
-                if (fd2conn.size() <= (size_t)conn->fd) {
-                    fd2conn.resize(conn->fd + 1);
+            if (Connection* conn = handle_accept(fd, conn_pool)) {
+                // Pool'dan yangi connection o'rniga
+                Connection* pooled_conn = conn_pool.acquire();
+                pooled_conn->fd = conn->fd;
+                pooled_conn->want_read = true;
+                
+                delete conn;
+                
+                if (fd2conn.size() <= (size_t)pooled_conn->fd) {
+                    fd2conn.resize(pooled_conn->fd + 1);
                 }
-                assert(!fd2conn[conn->fd]);
-                fd2conn[conn->fd] = conn;
+                fd2conn[pooled_conn->fd] = pooled_conn;
             }
         }
 
